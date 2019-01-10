@@ -30,15 +30,11 @@
 
 sentryAction <- function(msg, conf, record, ...) {
   if(!all(c(require(RCurl),
-            require(Ruuid),
+            require(uuid),
             require(rjson),
             require(digest))))
-    stop("sentryAction depends on RCurl, Ruuid, rjson, digest.")
-
-  ## you install Ruuid this way (not with install.packages).
-  ## source("http://bioconductor.org/biocLite.R")
-  ## biocLite("Ruuid")
-
+    stop("sentryAction depends on RCurl, uuid, rjson, digest.")
+  
   if(exists('dsn', envir=conf)) {
     ## first time doing something with this handler: parse the dsn
     glued <- gsub('(.*)://(.*):(.*)@([^/]+)(.*)/(\\w)', '\\1://\\4\\5::\\2::\\3::\\6',
@@ -50,66 +46,79 @@ sentryAction <- function(msg, conf, record, ...) {
     assign('project', parts[4], envir=conf)
     rm('dsn', envir=conf)
   }
-
+  
   anythingMissing <- !sapply(c("server", "sentry.private.key", "sentry.public.key", "project"),
                              exists, envir=conf)
-
+  
   if(length(list(...)) && 'dry' %in% names(list(...))) {
     return(all(!anythingMissing))
   }
-
+  
+  # Past the dry run, do the real work from here
+  
   if(any(anythingMissing)) {
     missing <- names(anythingMissing)[anythingMissing]
     stop(paste("this handler with sentryAction misses ", paste(missing, collapse=", "), ".\n", sep=""))
   }
-
+  
+  if(missing(record))  # needed for `level` and `timestamp` fields.
+    stop("sentryAction needs to receive the logging record.\n")
+  
+  # Bail early if the record level doesn't match a threshold
+  if (exists('threshold', envir=conf)) {
+    # The higher the number the more coarse the level (FINEST is 1, FATAL is 50)
+    if (as.numeric(record$level) < loglevels[[with(conf, threshold)]]) {
+      return()
+    }
+  }
+  
   sentry.server <- with(conf, server)
   sentry.private.key <- with(conf, sentry.private.key)
   sentry.public.key <- with(conf, sentry.public.key)
   project <-  with(conf, project)
   client.name <- tryCatch(with(conf, client.name), error = function(e) "r.logging")
+  
+  # Convert the timestamp to UTC
+  recordTimestamp <- as.POSIXct(record$timestamp)
+  attributes(recordTimestamp)$tzone <- "GMT"
+  formattedRecordTimestamp <- format(recordTimestamp, "%Y-%m-%dT%H:%M:%S")
 
-  if(missing(record))  # needed for `level` and `timestamp` fields.
-    stop("sentryAction needs to receive the logging record.\n")
-
-  ## `view.name`: the name of the function where the log record was generated.
-  functionCallStack <- sys.calls()
-  view.name <- tryCatch({
-    perpretator.call <- functionCallStack[length(functionCallStack) - 4][[1]]
-    perpretator.name <- as.character(perpretator.call)[[1]]
-    view.name <- perpretator.name
-  }, error = function(e) "<interactive>")
+  # Get the current sdk version
+  sdkVersion <- as.character(packageVersion('logging.handlers'))
 
   params <- list("project" = project,
-               "event_id" = gsub("-", "", as.character(getuuid())),
-               "culprit" = view.name,
-               "timestamp" = record$timestamp,
-               "message" = msg,
-               "level" = as.numeric(record$level),
-               "logger" = record$logger,
-               "server_name" = client.name)
+                 "event_id" = gsub("-", "", as.character(UUIDgenerate(FALSE))),
+                 "timestamp" = formattedRecordTimestamp,
+                 "message" = record$msg,
+                 "level" = as.numeric(record$level),
+                 "logger" = record$logger,
+                 "server_name" = client.name,
+                 "platform" = "other",
+                 "sdk" = list("name" = "r-logging.handler",
+                              "version" = sdkVersion))
+  
+  if(exists('client.env', envir=conf)) {
+    params$environment <- with(conf, client.env)
+  }
 
   metadata <- list()
-  metadata$call_stack <- paste(lapply(functionCallStack, deparse), collapse=" || ")
+  metadata$call_stack <- paste(lapply(sys.calls(), deparse), collapse=" || ")
   params$extra <- metadata
-
+  
   repr <- as.character(toJSON(params))
-
+  
   url <- paste(sentry.server, "api", "store", "", sep="/")
-
   timestamp <- Sys.time()
   timestampSeconds <- format(timestamp, "%s")
-  to.sign <- paste(timestampSeconds, repr, sep=' ')
-  signature <- hmac(sentry.private.key, to.sign, "sha1")
-
-  x.sentry.auth.parts <- c(paste("sentry_version", "2.0", sep="="),
-                           paste("sentry_signature", signature, sep="="),
+  
+  x.sentry.auth.parts <- c(paste("sentry_version", "5", sep="="),
                            paste("sentry_timestamp", timestampSeconds, sep="="),
                            paste("sentry_key", sentry.public.key, sep="="),
-                           paste("sentry_client", "r-logging.handler", sep="="))
+                           paste("sentry_secret", sentry.private.key, sep="="), # TODO: Per the doc this is optional and we should only pass it if it was provided on the DSN. Right now we require it.
+                           paste("sentry_client", paste("r-logging.handler", sdkVersion, sep="/"), sep="="))
   x.sentry.auth <- paste("Sentry", paste(x.sentry.auth.parts, collapse=", "))
   hdr <- c('Content-Type' = 'application/octet-stream', 'X-Sentry-Auth' = x.sentry.auth)
-
+  
   httpPOST(url, httpheader = hdr, postfields = toJSON(params))
-
+  
 }
